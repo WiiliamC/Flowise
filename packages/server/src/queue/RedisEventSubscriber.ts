@@ -143,6 +143,9 @@ export class RedisEventSubscriber {
                 case 'calledTools':
                     this.sseStreamer.streamCalledToolsEvent(chatId, data)
                     break
+                case 'toolCallCompleted':
+                    this.sseStreamer.streamToolCallCompletedEvent(chatId, data)
+                    break
                 case 'fileAnnotations':
                     this.sseStreamer.streamFileAnnotationsEvent(chatId, data)
                     break

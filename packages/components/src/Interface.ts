@@ -194,6 +194,14 @@ export interface IUsedTool {
     error?: string
 }
 
+export interface IToolCallCompleted {
+    toolCallId: string
+    tool: string
+    toolInput: object
+    toolOutput: string | object
+    error?: string
+}
+
 export interface IMultiAgentNode {
     node: any
     name: string
@@ -439,6 +447,7 @@ export interface IServerSideEventStreamer {
     streamSourceDocumentsEvent(chatId: string, data: any): void
     streamUsedToolsEvent(chatId: string, data: any): void
     streamCalledToolsEvent(chatId: string, data: any): void
+    streamToolCallCompletedEvent(chatId: string, data: IToolCallCompleted): void
     streamFileAnnotationsEvent(chatId: string, data: any): void
     streamToolEvent(chatId: string, data: any): void
     streamAgentReasoningEvent(chatId: string, data: any): void

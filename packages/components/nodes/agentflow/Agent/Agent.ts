@@ -9,6 +9,7 @@ import {
     INodeOptionsValue,
     INodeParams,
     IServerSideEventStreamer,
+    IToolCallCompleted,
     IUsedTool
 } from '../../../src/Interface'
 import { ContentBlock } from 'langchain'
@@ -2095,12 +2096,7 @@ class Agent_Agentflow implements INode {
         const sseStreamer: IServerSideEventStreamer = options.sseStreamer as IServerSideEventStreamer
 
         if (response.tool_calls) {
-            const formattedToolCalls = response.tool_calls.map((toolCall: any) => ({
-                tool: toolCall.name || 'tool',
-                toolInput: toolCall.args,
-                toolOutput: ''
-            }))
-            sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         if (response.usage_metadata) {
@@ -2108,6 +2104,39 @@ class Agent_Agentflow implements INode {
         }
 
         sseStreamer.streamEndEvent(chatId)
+    }
+
+    private isToolCallCompletedEventEnabled(): boolean {
+        return process.env.ENABLE_TOOL_CALL_COMPLETED_EVENT === 'true'
+    }
+
+    private streamCalledToolsEvent(sseStreamer: IServerSideEventStreamer, chatId: string, toolCalls: any[]): void {
+        const formattedToolCalls = toolCalls.map((toolCall: any) => ({
+            tool: toolCall.name || 'tool',
+            toolInput: toolCall.args,
+            toolOutput: '',
+            ...(this.isToolCallCompletedEventEnabled() && toolCall.id ? { toolCallId: toolCall.id } : {})
+        }))
+        sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+    }
+
+    private streamToolCallCompletedEvent(
+        sseStreamer: IServerSideEventStreamer | undefined,
+        chatId: string,
+        toolCall: any,
+        toolInput: object,
+        toolOutput: string | object,
+        error?: string
+    ): void {
+        if (!this.isToolCallCompletedEventEnabled() || !sseStreamer || !toolCall.id) return
+        const data: IToolCallCompleted = {
+            toolCallId: toolCall.id,
+            tool: toolCall.name || 'tool',
+            toolInput,
+            toolOutput,
+            ...(error ? { error } : {})
+        }
+        sseStreamer.streamToolCallCompletedEvent(chatId, data)
     }
 
     /**
@@ -2179,12 +2208,7 @@ class Agent_Agentflow implements INode {
 
         // Stream tool calls if available
         if (sseStreamer) {
-            const formattedToolCalls = response.tool_calls.map((toolCall: any) => ({
-                tool: toolCall.name || 'tool',
-                toolInput: toolCall.args,
-                toolOutput: ''
-            }))
-            sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         // Remove tool calls with no id
@@ -2294,6 +2318,8 @@ class Agent_Agentflow implements INode {
                         }
                     }
 
+                    this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput ?? toolCall.args, toolOutput)
+
                     // Add tool message to conversation
                     messages.push({
                         role: 'tool',
@@ -2335,9 +2361,12 @@ class Agent_Agentflow implements INode {
                         toolOutput: '',
                         error: getErrorMessage(e)
                     })
+                    this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput, '', getErrorMessage(e))
                     sseStreamer?.streamUsedToolsEvent(chatId, flatten(usedTools))
                     throw new Error(getErrorMessage(e))
                 }
+            } else {
+                this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolCall.args, '', `Tool not found: ${toolCall.name}`)
             }
         }
 
@@ -2560,12 +2589,7 @@ class Agent_Agentflow implements INode {
 
         // Stream tool calls if available
         if (sseStreamer) {
-            const formattedToolCalls = response.tool_calls.map((toolCall: any) => ({
-                tool: toolCall.name || 'tool',
-                toolInput: toolCall.args,
-                toolOutput: ''
-            }))
-            sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         // Remove tool calls with no id
@@ -2594,6 +2618,9 @@ class Agent_Agentflow implements INode {
             const toolCall = response.tool_calls[i]
 
             const selectedTool = toolsInstance.find((tool) => tool.name === toolCall.name)
+            if (!selectedTool && humanInput.type === 'proceed') {
+                this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolCall.args, '', `Tool not found: ${toolCall.name}`)
+            }
             if (selectedTool) {
                 let parsedDocs
                 let parsedArtifacts
@@ -2666,6 +2693,8 @@ class Agent_Agentflow implements INode {
                             }
                         }
 
+                        this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput ?? toolCall.args, toolOutput)
+
                         // Add tool message to conversation
                         messages.push({
                             role: 'tool',
@@ -2707,6 +2736,7 @@ class Agent_Agentflow implements INode {
                             toolOutput: '',
                             error: getErrorMessage(e)
                         })
+                        this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput, '', getErrorMessage(e))
                         sseStreamer?.streamUsedToolsEvent(chatId, flatten(usedTools))
                         throw new Error(getErrorMessage(e))
                     }

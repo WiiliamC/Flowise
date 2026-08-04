@@ -30,6 +30,7 @@ services:
             - SECRETKEY_PATH=/home/node/.flowise
             - LOG_PATH=/home/node/.flowise/logs
             - BLOB_STORAGE_PATH=/home/node/.flowise/storage
+            - ENABLE_TOOL_CALL_COMPLETED_EVENT=${ENABLE_TOOL_CALL_COMPLETED_EVENT:-false}
             # --- Queue Vars (Main Instance) ---
             - MODE=queue
             - QUEUE_NAME=flowise-queue # Ensure this matches worker
@@ -55,6 +56,7 @@ services:
             - SECRETKEY_PATH=/home/node/.flowise
             - LOG_PATH=/home/node/.flowise/logs
             - BLOB_STORAGE_PATH=/home/node/.flowise/storage
+            - ENABLE_TOOL_CALL_COMPLETED_EVENT=${ENABLE_TOOL_CALL_COMPLETED_EVENT:-false}
             # --- Queue Vars (Main Instance) ---
             - MODE=queue
             - QUEUE_NAME=flowise-queue # Ensure this matches worker
