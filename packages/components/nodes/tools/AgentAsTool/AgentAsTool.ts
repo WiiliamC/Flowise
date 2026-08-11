@@ -2,7 +2,7 @@ import { DataSource } from 'typeorm'
 import { z } from 'zod/v3'
 import { RunnableConfig } from '@langchain/core/runnables'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
-import { StructuredTool } from '@langchain/core/tools'
+import { StructuredTool, ToolInputParsingException } from '@langchain/core/tools'
 import { ICommonObject, IDatabaseEntity, INode, INodeData, INodeOptionsValue, INodeParams } from '../../../src/Interface'
 import {
     getCredentialData,
@@ -209,6 +209,8 @@ class AgentAsTool_Tools implements INode {
 }
 
 class AgentflowTool extends StructuredTool {
+    readonly useToolInputTypeConversion = true
+
     static lc_name() {
         return 'AgentflowTool'
     }
@@ -281,7 +283,7 @@ class AgentflowTool extends StructuredTool {
         try {
             parsed = await parseWithTypeConversion(this.schema, arg)
         } catch (e) {
-            throw new Error(`Received tool input did not match expected schema: ${JSON.stringify(arg)}`)
+            throw new ToolInputParsingException(`Received tool input did not match expected schema`, JSON.stringify(arg))
         }
         const callbackManager_ = await CallbackManager.configure(
             config.callbacks,

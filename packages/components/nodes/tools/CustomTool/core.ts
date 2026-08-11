@@ -1,18 +1,9 @@
 import { z } from 'zod/v3'
 import { RunnableConfig } from '@langchain/core/runnables'
-import { StructuredTool, ToolParams } from '@langchain/core/tools'
+import { StructuredTool, ToolInputParsingException, ToolParams } from '@langchain/core/tools'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
 import { executeJavaScriptCode, createCodeExecutionSandbox, parseWithTypeConversion } from '../../../src/utils'
 import { ICommonObject } from '../../../src/Interface'
-
-class ToolInputParsingException extends Error {
-    output?: string
-
-    constructor(message: string, output?: string) {
-        super(message)
-        this.output = output
-    }
-}
 
 export interface BaseDynamicToolInput extends ToolParams {
     name: string
@@ -21,18 +12,13 @@ export interface BaseDynamicToolInput extends ToolParams {
     returnDirect?: boolean
 }
 
-export interface DynamicStructuredToolInput<
-    // eslint-disable-next-line
-    T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>
-> extends BaseDynamicToolInput {
+export interface DynamicStructuredToolInput<T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>>
+    extends BaseDynamicToolInput {
     func?: (input: z.infer<T>, runManager?: CallbackManagerForToolRun) => Promise<string>
     schema: T
 }
 
-export class DynamicStructuredTool<
-    // eslint-disable-next-line
-    T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>
-> extends StructuredTool {
+export class DynamicStructuredTool<T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>> extends StructuredTool {
     name: string
 
     description: string
@@ -43,6 +29,7 @@ export class DynamicStructuredTool<
 
     // @ts-ignore
     schema: T
+    readonly useToolInputTypeConversion = true
     private variables: any[]
     private flowObj: any
 

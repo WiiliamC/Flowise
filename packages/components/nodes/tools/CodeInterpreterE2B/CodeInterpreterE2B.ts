@@ -99,6 +99,8 @@ type E2BToolInput = {
 }
 
 export class E2BTool extends StructuredTool {
+    readonly useToolInputTypeConversion = true
+
     static lc_name() {
         return 'E2BTool'
     }

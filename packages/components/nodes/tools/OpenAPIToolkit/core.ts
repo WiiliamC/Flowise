@@ -1,7 +1,7 @@
 import { z } from 'zod/v3'
 import { RequestInit } from 'node-fetch'
 import { RunnableConfig } from '@langchain/core/runnables'
-import { StructuredTool, ToolParams } from '@langchain/core/tools'
+import { StructuredTool, ToolInputParsingException, ToolParams } from '@langchain/core/tools'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
 import { executeJavaScriptCode, createCodeExecutionSandbox, parseWithTypeConversion } from '../../../src/utils'
 import { ICommonObject } from '../../../src/Interface'
@@ -92,25 +92,14 @@ const getUrl = (baseUrl: string, requestObject: HttpRequestObject) => {
     return url
 }
 
-class ToolInputParsingException extends Error {
-    output?: string
-
-    constructor(message: string, output?: string) {
-        super(message)
-        this.output = output
-    }
-}
-
 export interface BaseDynamicToolInput extends ToolParams {
     name: string
     description: string
     returnDirect?: boolean
 }
 
-export interface DynamicStructuredToolInput<
-    // eslint-disable-next-line
-    T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>
-> extends BaseDynamicToolInput {
+export interface DynamicStructuredToolInput<T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>>
+    extends BaseDynamicToolInput {
     func?: (input: z.infer<T>, runManager?: CallbackManagerForToolRun) => Promise<string>
     schema: T
     baseUrl: string
@@ -121,10 +110,9 @@ export interface DynamicStructuredToolInput<
     removeNulls?: boolean
 }
 
-export class DynamicStructuredTool<
-    // eslint-disable-next-line
-    T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>
-> extends StructuredTool {
+export class DynamicStructuredTool<T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>> extends StructuredTool {
+    readonly useToolInputTypeConversion = true
+
     name: string
 
     description: string
@@ -176,7 +164,7 @@ export class DynamicStructuredTool<
         try {
             parsed = await parseWithTypeConversion(this.schema, arg)
         } catch (e) {
-            throw new ToolInputParsingException(`Received tool input did not match expected schema ${e}`, JSON.stringify(arg))
+            throw new ToolInputParsingException(`Received tool input did not match expected schema`, JSON.stringify(arg))
         }
         const callbackManager_ = await CallbackManager.configure(
             config.callbacks,

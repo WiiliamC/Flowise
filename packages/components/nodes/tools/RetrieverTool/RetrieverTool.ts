@@ -27,6 +27,8 @@ interface DynamicStructuredToolInput<T extends z.ZodObject<any, any, any, any> =
 class DynamicStructuredTool<T extends z.ZodObject<any, any, any, any> = z.ZodObject<any, any, any, any>> extends StructuredTool<
     T extends ZodObjectAny ? T : ZodObjectAny
 > {
+    readonly useToolInputTypeConversion = true
+
     static lc_name() {
         return 'DynamicStructuredTool'
     }

@@ -13,14 +13,15 @@ import {
     IUsedTool
 } from '../../../src/Interface'
 import { ContentBlock } from 'langchain'
-import { AIMessageChunk, BaseMessageLike } from '@langchain/core/messages'
+import { AIMessageChunk, BaseMessageLike, ToolMessage } from '@langchain/core/messages'
 import { AnalyticHandler } from '../../../src/handler'
 import { DEFAULT_SUMMARIZER_TEMPLATE } from '../prompt'
 import { ILLMMessage, IResponseMetadata } from '../Interface.Agentflow'
-import { Tool } from '@langchain/core/tools'
+import { Tool, ToolInputParsingException } from '@langchain/core/tools'
+import { validate, type OutputUnit } from '@cfworker/json-schema'
 import { ARTIFACTS_PREFIX, SOURCE_DOCUMENTS_PREFIX, TOOL_ARGS_PREFIX } from '../../../src/agents'
 import { flatten } from 'lodash'
-import { toolSchemaToJsonSchema, type ToolJsonSchema } from '../../../src/utils'
+import { parseWithTypeConversion, toolSchemaToJsonSchema, type ToolJsonSchema } from '../../../src/utils'
 import { getErrorMessage } from '../../../src/error'
 import { DataSource } from 'typeorm'
 import { randomBytes } from 'crypto'
@@ -76,6 +77,19 @@ interface ISimpliefiedTool {
         name: string
     }
 }
+
+interface IToolInputValidationRetryState {
+    maxRetries: number
+    roundsUsed: number
+}
+
+interface IToolInputValidationFailure {
+    tool: string
+    toolCallId: string
+    issues: Array<{ path: string; expected: string; receivedType: string; keyword?: string }>
+}
+
+const MAX_TOOL_INPUT_VALIDATION_RETRIES = 5
 
 /**
  * Sanitizes a string to be used as a tool name.
@@ -270,6 +284,18 @@ class Agent_Agentflow implements INode {
                         optional: true
                     }
                 ]
+            },
+            {
+                label: 'Tool Input Validation Max Retries',
+                name: 'agentToolInputValidationMaxRetries',
+                type: 'options',
+                default: '2',
+                optional: true,
+                options: Array.from({ length: MAX_TOOL_INPUT_VALIDATION_RETRIES + 1 }, (_, retries) => ({
+                    label: retries.toString(),
+                    name: retries.toString()
+                })),
+                description: 'Additional model correction rounds after invalid tool arguments. Set to 0 to disable recovery.'
             },
             {
                 label: 'Knowledge (Document Stores)',
@@ -1108,6 +1134,10 @@ class Agent_Agentflow implements INode {
             const humanInput: IHumanInput = typeof _humanInput === 'string' ? JSON.parse(_humanInput) : _humanInput
             const humanInputAction = options.humanInputAction
             const iterationContext = options.iterationContext
+            const validationRetryState: IToolInputValidationRetryState = {
+                maxRetries: this.getToolInputValidationMaxRetries(nodeData.inputs?.agentToolInputValidationMaxRetries),
+                roundsUsed: 0
+            }
 
             // Track execution time
             const startTime = Date.now()
@@ -1133,7 +1163,8 @@ class Agent_Agentflow implements INode {
                     isStreamable,
                     isLastNode,
                     iterationContext,
-                    isStructuredOutput
+                    isStructuredOutput,
+                    validationRetryState
                 })
 
                 response = result.response
@@ -1209,7 +1240,8 @@ class Agent_Agentflow implements INode {
                     iterationContext,
                     isStructuredOutput,
                     accumulatedReasonContent: reasonContent,
-                    accumulatedReasoningDuration: thinkingDuration
+                    accumulatedReasoningDuration: thinkingDuration,
+                    validationRetryState
                 })
 
                 response = result.response
@@ -2139,6 +2171,262 @@ class Agent_Agentflow implements INode {
         sseStreamer.streamToolCallCompletedEvent(chatId, data)
     }
 
+    private getToolInputValidationMaxRetries(value: unknown): number {
+        if (value === undefined || value === null || value === '') return 2
+        const retries = Number(value)
+        return Number.isFinite(retries) ? Math.min(MAX_TOOL_INPUT_VALIDATION_RETRIES, Math.max(0, Math.floor(retries))) : 2
+    }
+
+    private getReceivedType(value: unknown): string {
+        if (value === undefined) return 'missing'
+        if (value === null) return 'null'
+        if (Array.isArray(value)) return 'array'
+        return typeof value
+    }
+
+    private getValueAtPath(input: unknown, path: Array<string | number>): unknown {
+        let value = input as any
+        for (const segment of path) {
+            if (value === null || value === undefined || typeof value !== 'object') return undefined
+            value = value[segment]
+        }
+        return value
+    }
+
+    private formatValidationPath(path: Array<string | number>): string {
+        return path.reduce<string>((formatted, segment) => {
+            return typeof segment === 'number' ? `${formatted}[${segment}]` : `${formatted}.${segment}`
+        }, '$')
+    }
+
+    private getZodIssueExpectedDescription(issue: any): string {
+        switch (issue.code) {
+            case 'invalid_type':
+                return typeof issue.expected === 'string' ? issue.expected : 'the required type'
+            case 'invalid_literal':
+                return 'the required literal value'
+            case 'invalid_enum_value':
+                return 'one of the allowed enum values'
+            case 'invalid_union':
+            case 'invalid_union_discriminator':
+                return 'one of the allowed schema alternatives'
+            case 'invalid_arguments':
+                return 'valid function arguments'
+            case 'invalid_return_type':
+                return 'a valid function return value'
+            case 'invalid_date':
+                return 'a valid date'
+            case 'invalid_string': {
+                const knownFormats: Record<string, string> = {
+                    email: 'email',
+                    url: 'URL',
+                    emoji: 'emoji',
+                    uuid: 'UUID',
+                    cuid: 'CUID',
+                    cuid2: 'CUID2',
+                    ulid: 'ULID',
+                    datetime: 'datetime',
+                    ip: 'IP address'
+                }
+                return typeof issue.validation === 'string' && knownFormats[issue.validation]
+                    ? `a valid ${knownFormats[issue.validation]} string`
+                    : 'a valid string'
+            }
+            case 'too_small':
+                return `at least ${issue.minimum}`
+            case 'too_big':
+                return `at most ${issue.maximum}`
+            case 'not_multiple_of':
+                return `a multiple of ${issue.multipleOf}`
+            case 'not_finite':
+                return 'a finite number'
+            case 'custom':
+            default:
+                return 'the tool input schema'
+        }
+    }
+
+    private getJsonPointerPath(pointer: string, input: unknown): Array<string | number> {
+        const segments =
+            pointer === '#'
+                ? []
+                : pointer
+                      .replace(/^#\//, '')
+                      .split('/')
+                      .map((segment) => segment.replace(/~1/g, '/').replace(/~0/g, '~'))
+        let value = input
+        return segments.map((segment) => {
+            const pathSegment = Array.isArray(value) && /^\d+$/.test(segment) ? Number(segment) : segment
+            value = this.getValueAtPath(value, [pathSegment])
+            return pathSegment
+        })
+    }
+
+    private getJsonSchemaKeywordValue(schema: any, keywordLocation: string): unknown {
+        const segments = this.getJsonPointerPath(keywordLocation, schema)
+        let value = schema
+        for (const segment of segments) {
+            if (segment === '$ref' && value && typeof value === 'object' && typeof value.$ref === 'string' && value.$ref.startsWith('#')) {
+                value = this.getValueAtPath(schema, this.getJsonPointerPath(value.$ref, schema))
+            } else {
+                value = this.getValueAtPath(value, [segment])
+            }
+        }
+        return value
+    }
+
+    private getJsonSchemaExpectedDescription(keyword: string, constraint: unknown): string {
+        if (keyword === 'type') {
+            if (typeof constraint === 'string') return constraint
+            if (Array.isArray(constraint) && constraint.every((value) => typeof value === 'string')) return constraint.join(' or ')
+        }
+        if (typeof constraint === 'number') {
+            const descriptions: Record<string, string> = {
+                minimum: `minimum ${constraint}`,
+                maximum: `maximum ${constraint}`,
+                exclusiveMinimum: `exclusive minimum ${constraint}`,
+                exclusiveMaximum: `exclusive maximum ${constraint}`,
+                multipleOf: `a multiple of ${constraint}`,
+                minLength: `minimum length ${constraint}`,
+                maxLength: `maximum length ${constraint}`,
+                minItems: `minimum item count ${constraint}`,
+                maxItems: `maximum item count ${constraint}`
+            }
+            if (descriptions[keyword]) return descriptions[keyword]
+        }
+
+        const descriptions: Record<string, string> = {
+            type: 'the required type',
+            required: 'required property',
+            additionalProperties: 'no additional properties',
+            enum: 'one of the allowed enum values',
+            const: 'the required constant value',
+            minimum: 'the minimum constraint',
+            maximum: 'the maximum constraint',
+            exclusiveMinimum: 'the exclusive minimum constraint',
+            exclusiveMaximum: 'the exclusive maximum constraint',
+            multipleOf: 'the multipleOf constraint',
+            minLength: 'the minimum length constraint',
+            maxLength: 'the maximum length constraint',
+            pattern: 'the required string pattern',
+            minItems: 'the minimum item count',
+            maxItems: 'the maximum item count',
+            uniqueItems: 'unique array items',
+            anyOf: 'one of the allowed schema alternatives',
+            oneOf: 'exactly one allowed schema alternative',
+            allOf: 'all required schema constraints',
+            $ref: 'the referenced schema',
+            format: 'the required format'
+        }
+        return descriptions[keyword] ?? `the JSON Schema ${keyword} constraint`
+    }
+
+    private getJsonSchemaIssues(schema: any, value: any): IToolInputValidationFailure['issues'] {
+        let errors: OutputUnit[]
+        try {
+            errors = validate(value, schema).errors
+        } catch {
+            return []
+        }
+
+        return errors.flatMap((error) => {
+            let issuePath = this.getJsonPointerPath(error.instanceLocation, value)
+            if (error.keyword === 'required') {
+                const missingProperty = /^Instance does not have required property "(.*)"\.$/.exec(error.error)?.[1]
+                if (missingProperty !== undefined) issuePath = [...issuePath, missingProperty]
+            } else if (error.keyword === 'additionalProperties') {
+                const additionalProperty = /^Property "(.*)" does not match additional properties schema\.$/.exec(error.error)?.[1]
+                if (additionalProperty !== undefined) issuePath = [...issuePath, additionalProperty]
+            }
+
+            return [
+                {
+                    path: this.formatValidationPath(issuePath),
+                    keyword: error.keyword,
+                    expected: this.getJsonSchemaExpectedDescription(
+                        error.keyword,
+                        this.getJsonSchemaKeywordValue(schema, error.keywordLocation)
+                    ),
+                    receivedType: this.getReceivedType(this.getValueAtPath(value, issuePath))
+                }
+            ]
+        })
+    }
+
+    private async isToolInputValid(selectedTool: any, args: any): Promise<boolean> {
+        const schema = selectedTool.schema
+        if (!schema) return true
+        try {
+            if (typeof schema.parseAsync === 'function') {
+                if (selectedTool.useToolInputTypeConversion) await parseWithTypeConversion(schema, args)
+                else await schema.parseAsync(args)
+                return true
+            }
+            if (typeof schema.safeParseAsync === 'function') return (await schema.safeParseAsync(args)).success
+            if (typeof schema.safeParse === 'function') return schema.safeParse(args).success
+            return validate(args, schema).valid
+        } catch {
+            return false
+        }
+    }
+
+    private formatToolInputValidationFailure(toolCall: any, selectedTool: any): IToolInputValidationFailure {
+        let result
+        try {
+            result = selectedTool.schema?.safeParse?.(toolCall.args)
+        } catch {
+            // Async refinements cannot be inspected synchronously; keep recovery possible with a generic sanitized issue.
+        }
+        const rawIssues = result && !result.success ? result.error?.issues ?? [] : []
+        const issues = rawIssues.flatMap((issue: any) => {
+            const issuePath = Array.isArray(issue.path) ? issue.path : []
+            if (issue.code === 'unrecognized_keys' && Array.isArray(issue.keys) && issue.keys.length) {
+                return issue.keys.map((key: string) => ({
+                    path: this.formatValidationPath([...issuePath, key]),
+                    expected: 'no additional properties',
+                    receivedType: this.getReceivedType(this.getValueAtPath(toolCall.args, [...issuePath, key]))
+                }))
+            }
+            return {
+                path: this.formatValidationPath(issuePath),
+                expected: this.getZodIssueExpectedDescription(issue),
+                receivedType: this.getReceivedType(this.getValueAtPath(toolCall.args, issuePath))
+            }
+        })
+
+        const jsonSchemaIssues =
+            !issues.length && !selectedTool.schema?.safeParse ? this.getJsonSchemaIssues(selectedTool.schema, toolCall.args) : []
+        return {
+            tool: toolCall.name || 'tool',
+            toolCallId: toolCall.id || 'unknown',
+            issues:
+                issues.length || jsonSchemaIssues.length
+                    ? [...issues, ...jsonSchemaIssues]
+                    : [{ path: '$', expected: 'the tool input schema', receivedType: this.getReceivedType(toolCall.args) }]
+        }
+    }
+
+    private toolInputValidationMessage(failure: IToolInputValidationFailure, attempt: number, maxAttempts: number): string {
+        const issueText = failure.issues
+            .map((issue) => `${issue.path}: Expected ${issue.expected}; received ${issue.receivedType}.`)
+            .join(' ')
+        return `Tool input validation failed for ${failure.tool} (attempt ${attempt}/${maxAttempts}). ${issueText} Correct the arguments to match the tool schema and call the tool again.`
+    }
+
+    private toolInputValidationExhaustedError(failures: IToolInputValidationFailure[], retryState: IToolInputValidationRetryState): Error {
+        return new Error(
+            `TOOL_INPUT_SCHEMA_VALIDATION_FAILED ${JSON.stringify({
+                code: 'TOOL_INPUT_SCHEMA_VALIDATION_FAILED',
+                tool: failures[0]?.tool,
+                toolCallId: failures[0]?.toolCallId,
+                issues: failures[0]?.issues ?? [],
+                ...(failures.length > 1 && { failures }),
+                attempt: retryState.roundsUsed,
+                maxAttempts: retryState.maxRetries + 1
+            })}`
+        )
+    }
+
     /**
      * Handles tool calls and their responses, with support for recursive tool calling
      */
@@ -2157,7 +2445,8 @@ class Agent_Agentflow implements INode {
         iterationContext,
         isStructuredOutput = false,
         accumulatedReasonContent: initialAccumulatedReasonContent,
-        accumulatedReasoningDuration: initialAccumulatedReasoningDuration
+        accumulatedReasoningDuration: initialAccumulatedReasoningDuration,
+        validationRetryState
     }: {
         response: AIMessageChunk
         messages: BaseMessageLike[]
@@ -2174,6 +2463,7 @@ class Agent_Agentflow implements INode {
         isStructuredOutput?: boolean
         accumulatedReasonContent?: string
         accumulatedReasoningDuration?: number
+        validationRetryState?: IToolInputValidationRetryState
     }): Promise<{
         response: AIMessageChunk
         usedTools: IUsedTool[]
@@ -2193,6 +2483,7 @@ class Agent_Agentflow implements INode {
         // Use reasoning from caller (first turn); subsequent turns are added when we get newResponse
         let accumulatedReasonContent = initialAccumulatedReasonContent ?? ''
         let accumulatedReasoningDuration = initialAccumulatedReasoningDuration ?? 0
+        const retryState = validationRetryState ?? { maxRetries: 2, roundsUsed: 0 }
 
         if (!response.tool_calls || response.tool_calls.length === 0) {
             return {
@@ -2204,11 +2495,6 @@ class Agent_Agentflow implements INode {
                 accumulatedReasonContent: accumulatedReasonContent || undefined,
                 accumulatedReasoningDuration: accumulatedReasoningDuration || undefined
             }
-        }
-
-        // Stream tool calls if available
-        if (sseStreamer) {
-            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         // Remove tool calls with no id
@@ -2232,7 +2518,29 @@ class Agent_Agentflow implements INode {
         // Add LLM response with tool calls to messages
         messages.push(response)
 
+        const toolInputValidity = new Map<any, boolean>()
+        const preExecutionToolCalls = (
+            await Promise.all(
+                response.tool_calls.map(async (toolCall) => {
+                    const selectedTool = toolsInstance.find((tool) => tool.name === toolCall.name)
+                    if (
+                        !selectedTool ||
+                        ((selectedTool as any).requiresHumanInput && (!iterationContext || Object.keys(iterationContext).length === 0))
+                    ) {
+                        return undefined
+                    }
+                    const isValid = await this.isToolInputValid(selectedTool, toolCall.args)
+                    toolInputValidity.set(toolCall, isValid)
+                    return isValid ? toolCall : undefined
+                })
+            )
+        ).filter((toolCall): toolCall is NonNullable<typeof toolCall> => toolCall !== undefined)
+        if (sseStreamer && preExecutionToolCalls.length) {
+            this.streamCalledToolsEvent(sseStreamer, chatId, preExecutionToolCalls)
+        }
+
         // Process each tool call
+        const validationFailures: IToolInputValidationFailure[] = []
         for (let i = 0; i < response.tool_calls.length; i++) {
             const toolCall = response.tool_calls[i]
 
@@ -2252,6 +2560,9 @@ class Agent_Agentflow implements INode {
                 }
 
                 if (isToolRequireHumanInput) {
+                    if (sseStreamer) {
+                        this.streamCalledToolsEvent(sseStreamer, chatId, [toolCall])
+                    }
                     const toolCallDetails = '```json\n' + JSON.stringify(toolCall, null, 2) + '\n```'
                     const responseContent = response.content + `\nAttempting to use tool:\n${toolCallDetails}`
                     response.content = responseContent
@@ -2268,6 +2579,26 @@ class Agent_Agentflow implements INode {
                         accumulatedReasonContent: accumulatedReasonContent || undefined,
                         accumulatedReasoningDuration: accumulatedReasoningDuration || undefined
                     }
+                }
+
+                if (toolInputValidity.get(toolCall) === false) {
+                    if (sseStreamer) {
+                        this.streamCalledToolsEvent(sseStreamer, chatId, [{ ...toolCall, args: {} }])
+                    }
+                    const failure = this.formatToolInputValidationFailure(toolCall, selectedTool)
+                    validationFailures.push(failure)
+                    const diagnostic = this.toolInputValidationMessage(failure, retryState.roundsUsed + 1, retryState.maxRetries + 1)
+                    messages.push(
+                        new ToolMessage({
+                            status: 'error',
+                            content: diagnostic,
+                            tool_call_id: toolCall.id!,
+                            name: toolCall.name
+                        })
+                    )
+                    usedTools.push({ tool: selectedTool.name, toolInput: {}, toolOutput: '', error: diagnostic })
+                    this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, {}, '', diagnostic)
+                    continue
                 }
 
                 let toolIds: ICommonObject | undefined
@@ -2339,6 +2670,29 @@ class Agent_Agentflow implements INode {
                         toolOutput
                     })
                 } catch (e) {
+                    if (e instanceof ToolInputParsingException) {
+                        if (sseStreamer) {
+                            this.streamCalledToolsEvent(sseStreamer, chatId, [{ ...toolCall, args: {} }])
+                        }
+                        const failure = this.formatToolInputValidationFailure(toolCall, selectedTool)
+                        validationFailures.push(failure)
+                        const diagnostic = this.toolInputValidationMessage(failure, retryState.roundsUsed + 1, retryState.maxRetries + 1)
+                        if (options.analyticHandlers && toolIds) {
+                            await options.analyticHandlers.onToolEnd(toolIds, new ToolInputParsingException(diagnostic))
+                        }
+                        messages.push(
+                            new ToolMessage({
+                                status: 'error',
+                                content: diagnostic,
+                                tool_call_id: toolCall.id!,
+                                name: toolCall.name
+                            })
+                        )
+                        usedTools.push({ tool: selectedTool.name, toolInput: {}, toolOutput: '', error: diagnostic })
+                        this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, {}, '', diagnostic)
+                        continue
+                    }
+
                     if (options.analyticHandlers && toolIds) {
                         await options.analyticHandlers.onToolEnd(toolIds, e)
                     }
@@ -2366,12 +2720,22 @@ class Agent_Agentflow implements INode {
                     throw new Error(getErrorMessage(e))
                 }
             } else {
+                if (sseStreamer) {
+                    this.streamCalledToolsEvent(sseStreamer, chatId, [toolCall])
+                }
                 this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolCall.args, '', `Tool not found: ${toolCall.name}`)
             }
         }
 
+        if (validationFailures.length > 0) {
+            retryState.roundsUsed += 1
+            if (retryState.roundsUsed >= retryState.maxRetries + 1) {
+                throw this.toolInputValidationExhaustedError(validationFailures, retryState)
+            }
+        }
+
         // Return direct tool output if there's exactly one tool with returnDirect
-        if (response.tool_calls.length === 1) {
+        if (validationFailures.length === 0 && response.tool_calls.length === 1) {
             const selectedTool = toolsInstance.find((tool) => tool.name === response.tool_calls?.[0]?.name)
             if (selectedTool && selectedTool.returnDirect) {
                 const lastToolOutput = usedTools[0]?.toolOutput || ''
@@ -2468,7 +2832,8 @@ class Agent_Agentflow implements INode {
                 iterationContext,
                 isStructuredOutput,
                 accumulatedReasonContent,
-                accumulatedReasoningDuration
+                accumulatedReasoningDuration,
+                validationRetryState: retryState
             })
 
             // Merge results from recursive tool calls
@@ -2515,7 +2880,8 @@ class Agent_Agentflow implements INode {
         isStreamable,
         isLastNode,
         iterationContext,
-        isStructuredOutput = false
+        isStructuredOutput = false,
+        validationRetryState
     }: {
         humanInput: IHumanInput
         humanInputAction: Record<string, any> | undefined
@@ -2531,6 +2897,7 @@ class Agent_Agentflow implements INode {
         isLastNode: boolean
         iterationContext: ICommonObject
         isStructuredOutput?: boolean
+        validationRetryState?: IToolInputValidationRetryState
     }): Promise<{
         response: AIMessageChunk
         usedTools: IUsedTool[]
@@ -2546,6 +2913,7 @@ class Agent_Agentflow implements INode {
         let sourceDocuments: Array<any> = []
         let artifacts: any[] = []
         let isWaitingForHumanInput: boolean | undefined
+        const retryState = validationRetryState ?? { maxRetries: 2, roundsUsed: 0 }
 
         const lastCheckpointMessages = humanInputAction?.data?.input?.messages ?? []
         if (!lastCheckpointMessages.length) {
@@ -2587,11 +2955,6 @@ class Agent_Agentflow implements INode {
             }
         }
 
-        // Stream tool calls if available
-        if (sseStreamer) {
-            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
-        }
-
         // Remove tool calls with no id
         const toBeRemovedToolCalls = []
         for (let i = 0; i < response.tool_calls.length; i++) {
@@ -2613,12 +2976,32 @@ class Agent_Agentflow implements INode {
         // Add LLM response with tool calls to messages
         messages.push(response)
 
+        const toolInputValidity = new Map<any, boolean>()
+        const preExecutionToolCalls = (
+            await Promise.all(
+                response.tool_calls.map(async (toolCall) => {
+                    const selectedTool = toolsInstance.find((tool) => tool.name === toolCall.name)
+                    if (!selectedTool || humanInput.type !== 'proceed') return undefined
+                    const isValid = await this.isToolInputValid(selectedTool, toolCall.args)
+                    toolInputValidity.set(toolCall, isValid)
+                    return isValid ? toolCall : undefined
+                })
+            )
+        ).filter((toolCall): toolCall is NonNullable<typeof toolCall> => toolCall !== undefined)
+        if (sseStreamer && preExecutionToolCalls.length) {
+            this.streamCalledToolsEvent(sseStreamer, chatId, preExecutionToolCalls)
+        }
+
         // Process each tool call
+        const validationFailures: IToolInputValidationFailure[] = []
         for (let i = 0; i < response.tool_calls.length; i++) {
             const toolCall = response.tool_calls[i]
 
             const selectedTool = toolsInstance.find((tool) => tool.name === toolCall.name)
             if (!selectedTool && humanInput.type === 'proceed') {
+                if (sseStreamer) {
+                    this.streamCalledToolsEvent(sseStreamer, chatId, [toolCall])
+                }
                 this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolCall.args, '', `Tool not found: ${toolCall.name}`)
             }
             if (selectedTool) {
@@ -2645,6 +3028,26 @@ class Agent_Agentflow implements INode {
                     }
                 }
                 if (humanInput.type === 'proceed') {
+                    if (toolInputValidity.get(toolCall) === false) {
+                        if (sseStreamer) {
+                            this.streamCalledToolsEvent(sseStreamer, chatId, [{ ...toolCall, args: {} }])
+                        }
+                        const failure = this.formatToolInputValidationFailure(toolCall, selectedTool)
+                        validationFailures.push(failure)
+                        const diagnostic = this.toolInputValidationMessage(failure, retryState.roundsUsed + 1, retryState.maxRetries + 1)
+                        messages.push(
+                            new ToolMessage({
+                                status: 'error',
+                                content: diagnostic,
+                                tool_call_id: toolCall.id!,
+                                name: toolCall.name
+                            })
+                        )
+                        usedTools.push({ tool: selectedTool.name, toolInput: {}, toolOutput: '', error: diagnostic })
+                        this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, {}, '', diagnostic)
+                        continue
+                    }
+
                     let toolIds: ICommonObject | undefined
                     if (options.analyticHandlers) {
                         toolIds = await options.analyticHandlers.onToolStart(toolCall.name, toolCall.args, options.parentTraceIds)
@@ -2714,6 +3117,33 @@ class Agent_Agentflow implements INode {
                             toolOutput
                         })
                     } catch (e) {
+                        if (e instanceof ToolInputParsingException) {
+                            if (sseStreamer) {
+                                this.streamCalledToolsEvent(sseStreamer, chatId, [{ ...toolCall, args: {} }])
+                            }
+                            const failure = this.formatToolInputValidationFailure(toolCall, selectedTool)
+                            validationFailures.push(failure)
+                            const diagnostic = this.toolInputValidationMessage(
+                                failure,
+                                retryState.roundsUsed + 1,
+                                retryState.maxRetries + 1
+                            )
+                            if (options.analyticHandlers && toolIds) {
+                                await options.analyticHandlers.onToolEnd(toolIds, new ToolInputParsingException(diagnostic))
+                            }
+                            messages.push(
+                                new ToolMessage({
+                                    status: 'error',
+                                    content: diagnostic,
+                                    tool_call_id: toolCall.id!,
+                                    name: toolCall.name
+                                })
+                            )
+                            usedTools.push({ tool: selectedTool.name, toolInput: {}, toolOutput: '', error: diagnostic })
+                            this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, {}, '', diagnostic)
+                            continue
+                        }
+
                         if (options.analyticHandlers && toolIds) {
                             await options.analyticHandlers.onToolEnd(toolIds, e)
                         }
@@ -2744,8 +3174,15 @@ class Agent_Agentflow implements INode {
             }
         }
 
+        if (validationFailures.length > 0) {
+            retryState.roundsUsed += 1
+            if (retryState.roundsUsed >= retryState.maxRetries + 1) {
+                throw this.toolInputValidationExhaustedError(validationFailures, retryState)
+            }
+        }
+
         // Return direct tool output if there's exactly one tool with returnDirect
-        if (response.tool_calls.length === 1) {
+        if (validationFailures.length === 0 && response.tool_calls.length === 1) {
             const selectedTool = toolsInstance.find((tool) => tool.name === response.tool_calls?.[0]?.name)
             if (selectedTool && selectedTool.returnDirect) {
                 const lastToolOutput = usedTools[0]?.toolOutput || ''
@@ -2848,7 +3285,8 @@ class Agent_Agentflow implements INode {
                 iterationContext,
                 isStructuredOutput,
                 accumulatedReasonContent,
-                accumulatedReasoningDuration
+                accumulatedReasoningDuration,
+                validationRetryState: retryState
             })
 
             // Merge results from recursive tool calls
