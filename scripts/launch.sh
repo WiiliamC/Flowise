@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# export ENABLE_TOOL_CALL_COMPLETED_EVENT=true
+export ENABLE_TOOL_CALL_COMPLETED_EVENT=true
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root" || exit 1
