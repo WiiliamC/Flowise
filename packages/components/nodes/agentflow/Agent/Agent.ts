@@ -9,6 +9,7 @@ import {
     INodeOptionsValue,
     INodeParams,
     IServerSideEventStreamer,
+    IToolCallCompleted,
     IUsedTool
 } from '../../../src/Interface'
 import { ContentBlock } from 'langchain'
@@ -38,7 +39,8 @@ import {
     convertMultiOptionsToStringArray,
     processTemplateVariables,
     configureStructuredOutput,
-    extractResponseContent
+    extractResponseContent,
+    extractStreamingChunkContent
 } from '../../../src/utils'
 import { sanitizeFileName } from '../../../src/validator'
 import { getModelConfigByModelName, MODEL_TYPE } from '../../../src/modelLoader'
@@ -1876,61 +1878,38 @@ class Agent_Agentflow implements INode {
         try {
             for await (const chunk of await llmNodeInstance.stream(messages, { signal: abortController?.signal })) {
                 if (sseStreamer && !isStructuredOutput) {
-                    let content = ''
+                    const { text: content, reasoning } = extractStreamingChunkContent(chunk, { includeCodeExecution: true })
 
-                    if (chunk.contentBlocks?.length) {
-                        for (const block of chunk.contentBlocks) {
-                            if (isLastNode) {
-                                // As soon as we see the first non-reasoning block, send last thinking event with duration
-                                if (block.type !== 'reasoning' && wasThinking && !sentLastThinkingEvent && thinkingStartTime != null) {
-                                    thinkingDuration = Math.round((Date.now() - thinkingStartTime) / 1000)
-                                    sseStreamer.streamThinkingEvent(chatId, '', thinkingDuration)
-                                    sentLastThinkingEvent = true
-                                }
-                                if (block.type === 'reasoning' && (block as { reasoning?: string }).reasoning) {
-                                    if (!thinkingStartTime) {
-                                        thinkingStartTime = Date.now()
-                                    }
-                                    wasThinking = true
-                                    const reasoningContent = (block as { reasoning: string }).reasoning
-                                    sseStreamer.streamThinkingEvent(chatId, reasoningContent)
-                                    reasonContent += reasoningContent
-                                }
+                    if (reasoning) {
+                        reasonContent += reasoning
+                        if (isLastNode) {
+                            if (!thinkingStartTime) {
+                                thinkingStartTime = Date.now()
                             }
+                            wasThinking = true
+                            sseStreamer.streamThinkingEvent(chatId, reasoning)
                         }
                     }
 
-                    if (typeof chunk === 'string') {
-                        content = chunk
-                    } else if (Array.isArray(chunk.content) && chunk.content.length > 0) {
-                        content = chunk.content
-                            .map((item: any) => {
-                                if ((item.text && !item.type) || (item.type === 'text' && item.text)) {
-                                    return item.text
-                                } else if (item.type === 'executableCode' && item.executableCode) {
-                                    const language = item.executableCode.language?.toLowerCase() || 'python'
-                                    return `\n\`\`\`${language}\n${item.executableCode.code}\n\`\`\`\n`
-                                } else if (item.type === 'codeExecutionResult' && item.codeExecutionResult) {
-                                    const outcome = item.codeExecutionResult.outcome || 'OUTCOME_OK'
-                                    const output = item.codeExecutionResult.output || ''
-                                    if (outcome === 'OUTCOME_OK' && output) {
-                                        return `**Code Output:**\n\`\`\`\n${output}\n\`\`\`\n`
-                                    } else if (outcome !== 'OUTCOME_OK') {
-                                        return `**Code Execution Error:**\n\`\`\`\n${output}\n\`\`\`\n`
-                                    }
-                                }
-                                return ''
-                            })
-                            .filter((text: string) => text)
-                            .join('')
-                    } else if (chunk.content) {
-                        content = chunk.content.toString()
+                    if (content && isLastNode && wasThinking && !sentLastThinkingEvent && thinkingStartTime != null) {
+                        thinkingDuration = Math.round((Date.now() - thinkingStartTime) / 1000)
+                        sseStreamer.streamThinkingEvent(chatId, '', thinkingDuration)
+                        sentLastThinkingEvent = true
                     }
-                    sseStreamer.streamTokenEvent(chatId, content)
+
+                    if (content) {
+                        sseStreamer.streamTokenEvent(chatId, content)
+                    }
                 }
 
                 const messageChunk = typeof chunk === 'string' ? new AIMessageChunk(chunk) : chunk
                 response = response.concat(messageChunk)
+            }
+
+            if (sseStreamer && !isStructuredOutput && isLastNode && wasThinking && !sentLastThinkingEvent && thinkingStartTime != null) {
+                thinkingDuration = Math.round((Date.now() - thinkingStartTime) / 1000)
+                sseStreamer.streamThinkingEvent(chatId, '', thinkingDuration)
+                sentLastThinkingEvent = true
             }
         } catch (error) {
             console.error('Error during streaming:', error)
@@ -2117,12 +2096,7 @@ class Agent_Agentflow implements INode {
         const sseStreamer: IServerSideEventStreamer = options.sseStreamer as IServerSideEventStreamer
 
         if (response.tool_calls) {
-            const formattedToolCalls = response.tool_calls.map((toolCall: any) => ({
-                tool: toolCall.name || 'tool',
-                toolInput: toolCall.args,
-                toolOutput: ''
-            }))
-            sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         if (response.usage_metadata) {
@@ -2130,6 +2104,39 @@ class Agent_Agentflow implements INode {
         }
 
         sseStreamer.streamEndEvent(chatId)
+    }
+
+    private isToolCallCompletedEventEnabled(): boolean {
+        return process.env.ENABLE_TOOL_CALL_COMPLETED_EVENT === 'true'
+    }
+
+    private streamCalledToolsEvent(sseStreamer: IServerSideEventStreamer, chatId: string, toolCalls: any[]): void {
+        const formattedToolCalls = toolCalls.map((toolCall: any) => ({
+            tool: toolCall.name || 'tool',
+            toolInput: toolCall.args,
+            toolOutput: '',
+            ...(this.isToolCallCompletedEventEnabled() && toolCall.id ? { toolCallId: toolCall.id } : {})
+        }))
+        sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+    }
+
+    private streamToolCallCompletedEvent(
+        sseStreamer: IServerSideEventStreamer | undefined,
+        chatId: string,
+        toolCall: any,
+        toolInput: object,
+        toolOutput: string | object,
+        error?: string
+    ): void {
+        if (!this.isToolCallCompletedEventEnabled() || !sseStreamer || !toolCall.id) return
+        const data: IToolCallCompleted = {
+            toolCallId: toolCall.id,
+            tool: toolCall.name || 'tool',
+            toolInput,
+            toolOutput,
+            ...(error ? { error } : {})
+        }
+        sseStreamer.streamToolCallCompletedEvent(chatId, data)
     }
 
     /**
@@ -2201,12 +2208,7 @@ class Agent_Agentflow implements INode {
 
         // Stream tool calls if available
         if (sseStreamer) {
-            const formattedToolCalls = response.tool_calls.map((toolCall: any) => ({
-                tool: toolCall.name || 'tool',
-                toolInput: toolCall.args,
-                toolOutput: ''
-            }))
-            sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         // Remove tool calls with no id
@@ -2316,6 +2318,8 @@ class Agent_Agentflow implements INode {
                         }
                     }
 
+                    this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput ?? toolCall.args, toolOutput)
+
                     // Add tool message to conversation
                     messages.push({
                         role: 'tool',
@@ -2357,9 +2361,12 @@ class Agent_Agentflow implements INode {
                         toolOutput: '',
                         error: getErrorMessage(e)
                     })
+                    this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput, '', getErrorMessage(e))
                     sseStreamer?.streamUsedToolsEvent(chatId, flatten(usedTools))
                     throw new Error(getErrorMessage(e))
                 }
+            } else {
+                this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolCall.args, '', `Tool not found: ${toolCall.name}`)
             }
         }
 
@@ -2582,12 +2589,7 @@ class Agent_Agentflow implements INode {
 
         // Stream tool calls if available
         if (sseStreamer) {
-            const formattedToolCalls = response.tool_calls.map((toolCall: any) => ({
-                tool: toolCall.name || 'tool',
-                toolInput: toolCall.args,
-                toolOutput: ''
-            }))
-            sseStreamer.streamCalledToolsEvent(chatId, flatten(formattedToolCalls))
+            this.streamCalledToolsEvent(sseStreamer, chatId, response.tool_calls)
         }
 
         // Remove tool calls with no id
@@ -2616,6 +2618,9 @@ class Agent_Agentflow implements INode {
             const toolCall = response.tool_calls[i]
 
             const selectedTool = toolsInstance.find((tool) => tool.name === toolCall.name)
+            if (!selectedTool && humanInput.type === 'proceed') {
+                this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolCall.args, '', `Tool not found: ${toolCall.name}`)
+            }
             if (selectedTool) {
                 let parsedDocs
                 let parsedArtifacts
@@ -2688,6 +2693,8 @@ class Agent_Agentflow implements INode {
                             }
                         }
 
+                        this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput ?? toolCall.args, toolOutput)
+
                         // Add tool message to conversation
                         messages.push({
                             role: 'tool',
@@ -2729,6 +2736,7 @@ class Agent_Agentflow implements INode {
                             toolOutput: '',
                             error: getErrorMessage(e)
                         })
+                        this.streamToolCallCompletedEvent(sseStreamer, chatId, toolCall, toolInput, '', getErrorMessage(e))
                         sseStreamer?.streamUsedToolsEvent(chatId, flatten(usedTools))
                         throw new Error(getErrorMessage(e))
                     }

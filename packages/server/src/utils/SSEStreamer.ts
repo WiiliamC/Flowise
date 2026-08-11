@@ -207,6 +207,13 @@ export class SSEStreamer implements IServerSideEventStreamer {
         }
         this.safeWrite(chatId, 'message:\ndata:' + JSON.stringify(clientResponse) + '\n\n')
     }
+    streamToolCallCompletedEvent(chatId: string, data: any): void {
+        const clientResponse = {
+            event: 'toolCallCompleted',
+            data: data
+        }
+        this.safeWrite(chatId, 'message:\ndata:' + JSON.stringify(clientResponse) + '\n\n')
+    }
     streamFileAnnotationsEvent(chatId: string, data: any): void {
         const clientResponse = {
             event: 'fileAnnotations',

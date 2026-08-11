@@ -101,6 +101,10 @@ export class RedisEventPublisher implements IServerSideEventStreamer {
         this.safePublish(chatId, JSON.stringify({ chatId, eventType: 'calledTools', data }))
     }
 
+    streamToolCallCompletedEvent(chatId: string, data: any) {
+        this.safePublish(chatId, JSON.stringify({ chatId, eventType: 'toolCallCompleted', data }))
+    }
+
     streamFileAnnotationsEvent(chatId: string, data: any) {
         this.safePublish(chatId, JSON.stringify({ chatId, eventType: 'fileAnnotations', data }))
     }
