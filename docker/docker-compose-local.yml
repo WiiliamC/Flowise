@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+    flowise:
+        image: ${FLOWISE_IMAGE}
+        container_name: ${FLOWISE_CONTAINER_NAME}
+        build:
+            context: ..
+            dockerfile: Dockerfile
+        restart: unless-stopped
+        environment:
+            PORT: ${FLOWISE_PORT}
+            DATABASE_PATH: /home/node/.flowise
+            SECRETKEY_PATH: /home/node/.flowise
+            LOG_PATH: /home/node/.flowise/logs
+            STORAGE_TYPE: local
+            BLOB_STORAGE_PATH: /home/node/.flowise/storage
+            ENABLE_TOOL_CALL_COMPLETED_EVENT: ${ENABLE_TOOL_CALL_COMPLETED_EVENT:-true}
+        ports:
+            - '${FLOWISE_PORT}:${FLOWISE_PORT}'
+        volumes:
+            - '${FLOWISE_DATA_DIR}:/home/node/.flowise'
+        healthcheck:
+            test: ['CMD', 'curl', '-f', 'http://localhost:${FLOWISE_PORT}/api/v1/ping']
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 30s
