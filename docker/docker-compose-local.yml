@@ -16,6 +16,7 @@ services:
             STORAGE_TYPE: local
             BLOB_STORAGE_PATH: /home/node/.flowise/storage
             ENABLE_TOOL_CALL_COMPLETED_EVENT: ${ENABLE_TOOL_CALL_COMPLETED_EVENT:-true}
+            HTTP_SECURITY_CHECK: ${HTTP_SECURITY_CHECK:-true}
         ports:
             - '${FLOWISE_PORT}:${FLOWISE_PORT}'
         volumes:
