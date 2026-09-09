@@ -19,7 +19,7 @@ class ChatOpenAICustom_ChatModels implements INode {
     constructor() {
         this.label = 'OpenAI Custom Model'
         this.name = 'chatOpenAICustom'
-        this.version = 4.0
+        this.version = 4.1
         this.type = 'ChatOpenAI-Custom'
         this.icon = 'openai.svg'
         this.category = 'Chat Models'
@@ -58,6 +58,24 @@ class ChatOpenAICustom_ChatModels implements INode {
                 name: 'streaming',
                 type: 'boolean',
                 default: true,
+                optional: true,
+                additionalParams: true
+            },
+            {
+                label: 'Reasoning Effort',
+                name: 'reasoningEffort',
+                type: 'options',
+                options: [
+                    { label: 'None', name: 'none' },
+                    { label: 'Minimal', name: 'minimal' },
+                    { label: 'Low', name: 'low' },
+                    { label: 'Medium', name: 'medium' },
+                    { label: 'High', name: 'high' },
+                    { label: 'XHigh', name: 'xhigh' },
+                    { label: 'Max', name: 'max' }
+                ],
+                description:
+                    'Leave unset to use the service default. None explicitly requests no reasoning. Supported values depend on the model.',
                 optional: true,
                 additionalParams: true
             },
@@ -129,6 +147,7 @@ class ChatOpenAICustom_ChatModels implements INode {
         const presencePenalty = nodeData.inputs?.presencePenalty as string
         const timeout = nodeData.inputs?.timeout as string
         const streaming = nodeData.inputs?.streaming as boolean
+        const reasoningEffort = nodeData.inputs?.reasoningEffort as string | undefined
         const basePath = nodeData.inputs?.basepath as string
         const baseOptions = nodeData.inputs?.baseOptions
         const cache = nodeData.inputs?.cache as BaseCache
@@ -151,6 +170,7 @@ class ChatOpenAICustom_ChatModels implements INode {
         if (presencePenalty) obj.presencePenalty = parseFloat(presencePenalty)
         if (timeout) obj.timeout = parseInt(timeout, 10)
         if (cache) obj.cache = cache
+        if (reasoningEffort) obj.modelKwargs = { reasoning_effort: reasoningEffort }
 
         let parsedBaseOptions: any | undefined = undefined
 
