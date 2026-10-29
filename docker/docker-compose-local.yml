@@ -9,6 +9,7 @@ services:
             dockerfile: Dockerfile
         restart: unless-stopped
         environment:
+            MODEL_LIST_CONFIG_JSON: ${MODEL_LIST_CONFIG_JSON}
             PORT: ${FLOWISE_PORT}
             DATABASE_PATH: /home/node/.flowise
             SECRETKEY_PATH: /home/node/.flowise
